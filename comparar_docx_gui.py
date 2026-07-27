@@ -3,7 +3,12 @@
 comparar_docx_gui.py
 ---------------------
 Interfaz gráfica para comparar hasta 7 documentos de Word (.docx) y generar
-un reporte .docx con los párrafos que difieren entre ellos.
+un reporte HTML con los párrafos que difieren entre ellos.
+
+Estructura del reporte:
+  • Columnas : Bloque | Pág.(aprox.) | <nombre doc 1> | <nombre doc 2> | …
+  • Las palabras que cambian llevan fondo amarillo directamente sobre el texto,
+    sin afectar las palabras que son idénticas.
 
 REQUISITOS:
     pip install python-docx
@@ -11,26 +16,22 @@ REQUISITOS:
 
 EJECUTAR:
     python comparar_docx_gui.py
-
-Si "tkinterdnd2" no está instalado la app funciona igual, solo sin
-arrastrar y soltar: se usa el botón "Agregar archivos...".
 """
 
 import os
 import sys
+import html
 import queue
+import re
 import threading
 import subprocess
 from pathlib import Path
 from difflib import SequenceMatcher
-from lxml import etree
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 from docx import Document
-from docx.shared import Pt, Cm, RGBColor
-from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml.ns import qn
 
 try:
@@ -42,10 +43,9 @@ except ImportError:
 MAX_DOCS = 7
 PALABRAS_POR_PAGINA_RESPALDO = 400
 
-# Mensajes especiales que viajan por la cola
-_MSG_LOG    = "LOG"
-_MSG_OK     = "OK"
-_MSG_ERROR  = "ERROR"
+_MSG_LOG   = "LOG"
+_MSG_OK    = "OK"
+_MSG_ERROR = "ERROR"
 
 
 # ==========================================================================
@@ -53,34 +53,16 @@ _MSG_ERROR  = "ERROR"
 # ==========================================================================
 
 def _reparar_docx(ruta_docx):
-    """
-    Devuelve un BytesIO con el .docx limpio de referencias a 'NULL'.
-
-    Algunos documentos contienen:
-      a) Entradas ZIP con nombre 'NULL' o que incluyen 'NULL' en su ruta.
-      b) Referencias a esas entradas en los archivos .rels (relaciones XML).
-
-    python-docx falla con "There is no item named 'word/NULL' in the archive"
-    cuando intenta cargar un recurso referenciado desde las relaciones pero
-    cuyo archivo no existe o tiene nombre nulo.  Esta función:
-      1. Omite del ZIP las entradas con nombre NULL.
-      2. Elimina de todos los archivos .rels las líneas <Relationship> que
-         apunten a 'NULL' (Target="NULL" o Target que termina en /NULL).
-    """
-    import zipfile, io, re
-
-    # Patrón que casa con <Relationship ... Target="...NULL..."/>
+    import zipfile, io
     RE_REL_NULL = re.compile(
         rb'<Relationship\b[^>]*\bTarget=["\'][^"\']*NULL[^"\']*["\'][^>]*/?>',
         re.IGNORECASE,
     )
-
     buf = io.BytesIO()
     with zipfile.ZipFile(ruta_docx, 'r') as zin, \
          zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zout:
         for item in zin.infolist():
             nombre = item.filename
-            # 1. Omitir entradas cuyo nombre sea NULL o contenga /NULL
             if not nombre:
                 continue
             partes = nombre.replace('\\', '/').split('/')
@@ -89,19 +71,15 @@ def _reparar_docx(ruta_docx):
             try:
                 datos = zin.read(nombre)
             except Exception:
-                continue   # entrada ilegible → se omite
-
-            # 2. En archivos de relaciones, borrar las referencias a NULL
+                continue
             if nombre.endswith('.rels'):
                 datos = RE_REL_NULL.sub(b'', datos)
-
             zout.writestr(item, datos)
     buf.seek(0)
     return buf
 
 
 def extraer_parrafos(ruta_docx):
-    # Intentar abrir directo; si falla por entradas NULL corruptas, reparar primero
     try:
         doc = Document(ruta_docx)
     except Exception as e:
@@ -120,14 +98,12 @@ def extraer_parrafos(ruta_docx):
         p_xml = p._p
         saltos  = p_xml.findall('.//' + qn('w:br') + "[@" + qn('w:type') + "='page']")
         renders = p_xml.findall('.//' + qn('w:lastRenderedPageBreak'))
-
         if renders:
             tiene_marcas_reales = True
             pagina_actual += len(renders)
         if saltos:
             tiene_marcas_reales = True
             pagina_actual += len(saltos)
-
         texto = p.text.strip()
         if texto:
             num_parrafo += 1
@@ -195,193 +171,388 @@ def calcular_diferencias(lista_parrafos_por_doc):
     return resultado
 
 
-def _sombrear_celda(celda, color_hex):
-    tcPr = celda._tc.get_or_add_tcPr()
-    shd = tcPr.makeelement(qn('w:shd'), {
-        qn('w:val'): 'clear', qn('w:color'): 'auto', qn('w:fill'): color_hex,
-    })
-    tcPr.append(shd)
-
-
-def _highlight_run(run, color="yellow"):
-    """
-    Aplica resaltado de color (highlight) a un run usando el elemento OOXML
-    w:highlight.  'color' debe ser un valor válido de OOXML: 'yellow', 'cyan',
-    'green', 'magenta', 'blue', 'red', 'darkBlue', etc.
-    """
-    rPr = run._r.get_or_add_rPr()
-    # Elimina cualquier highlight previo para evitar duplicados
-    for existing in rPr.findall(qn('w:highlight')):
-        rPr.remove(existing)
-    hl = etree.SubElement(rPr, qn('w:highlight'))
-    hl.set(qn('w:val'), color)
-
+# ==========================================================================
+# DIFF DE PALABRAS
+# ==========================================================================
 
 def diff_palabras(texto_base, texto_otro):
     """
-    Compara dos cadenas palabra a palabra con SequenceMatcher.
-
-    Devuelve una lista de tuplas (palabra, es_diferente) para cada texto:
-        - tokens_base : lista de (palabra_o_espacio, es_diferente)
-        - tokens_otro : lista de (palabra_o_espacio, es_diferente)
-
-    Las palabras marcadas como es_diferente=True son las que no están
-    presentes (o cambiaron) respecto al otro texto.
+    Compara dos textos token a token (palabras + espacios).
+    Retorna (tokens_base, tokens_otro): listas de (str, bool),
+    donde bool=True indica que el token es diferente.
     """
-    import re
+    def tokenizar(t):
+        return re.findall(r'\S+|\s+', t) if t else []
 
-    def tokenizar(texto):
-        """Separa el texto en palabras y espacios, preservando separadores."""
-        return re.findall(r'\S+|\s+', texto) if texto else []
+    pal_base = tokenizar(texto_base or "")
+    pal_otro = tokenizar(texto_otro or "")
+    sm = SequenceMatcher(None, pal_base, pal_otro, autojunk=False)
 
-    palabras_base = tokenizar(texto_base or "")
-    palabras_otro = tokenizar(texto_otro or "")
-
-    sm = SequenceMatcher(None, palabras_base, palabras_otro, autojunk=False)
-
-    tokens_base = []
-    tokens_otro = []
+    tokens_base: list = []
+    tokens_otro: list = []
 
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag == 'equal':
-            for t in palabras_base[i1:i2]:
+        if tag == "equal":
+            for t in pal_base[i1:i2]:
                 tokens_base.append((t, False))
-            for t in palabras_otro[j1:j2]:
+            for t in pal_otro[j1:j2]:
                 tokens_otro.append((t, False))
-        elif tag == 'replace':
-            for t in palabras_base[i1:i2]:
+        elif tag == "replace":
+            for t in pal_base[i1:i2]:
                 tokens_base.append((t, True))
-            for t in palabras_otro[j1:j2]:
+            for t in pal_otro[j1:j2]:
                 tokens_otro.append((t, True))
-        elif tag == 'delete':
-            for t in palabras_base[i1:i2]:
+        elif tag == "delete":
+            for t in pal_base[i1:i2]:
                 tokens_base.append((t, True))
-        elif tag == 'insert':
-            for t in palabras_otro[j1:j2]:
+        elif tag == "insert":
+            for t in pal_otro[j1:j2]:
                 tokens_otro.append((t, True))
 
     return tokens_base, tokens_otro
 
 
-def _escribir_celda_con_diff(parrafo, tokens):
+def tokens_a_html(tokens):
     """
-    Escribe los tokens (lista de (texto, es_diferente)) en el párrafo
-    de una celda, usando runs separados.  Los tokens marcados como
-    diferentes reciben fondo amarillo (highlight).
+    Convierte lista de (token, es_diferente) en HTML.
+    Los tokens iguales → texto plano.
+    Los tokens diferentes → <span class="diff">texto</span>
+    con fondo amarillo y negrita.
     """
+    partes = []
     for texto, diferente in tokens:
-        if not texto:  # saltar tokens vacíos
-            continue
-        run = parrafo.add_run(texto)
+        t_esc = html.escape(texto)
         if diferente:
-            _highlight_run(run, "yellow")
+            partes.append(f'<span class="diff">{t_esc}</span>')
+        else:
+            partes.append(t_esc)
+    return "".join(partes)
+
+
+# ==========================================================================
+# CONSTRUCCIÓN DEL REPORTE HTML
+# ==========================================================================
+
+_CSS = """
+/* ── Reset y base ─────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: 'Segoe UI', Calibri, Arial, sans-serif;
+    font-size: 13px;
+    background: #f0f4f8;
+    color: #1a1a2e;
+    padding: 24px 16px 48px;
+}
+
+h1 {
+    font-size: 1.5rem;
+    font-weight: 700;
+    color: #1e3a5f;
+    margin-bottom: 6px;
+}
+
+.subtitle {
+    color: #4a6080;
+    font-size: 0.9rem;
+    margin-bottom: 20px;
+}
+
+/* ── Tabla ────────────────────────────────────────── */
+.wrap {
+    overflow-x: auto;
+    border-radius: 10px;
+    box-shadow: 0 4px 20px rgba(0,0,0,.12);
+}
+
+table {
+    border-collapse: collapse;
+    width: 100%;
+    background: #fff;
+    min-width: 700px;
+}
+
+/* Encabezado */
+thead th {
+    background: #2e5395;
+    color: #fff;
+    font-weight: 600;
+    font-size: 0.82rem;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    padding: 11px 10px;
+    text-align: center;
+    border: 1px solid #1d3c72;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    white-space: nowrap;
+}
+thead th:nth-child(1),
+thead th:nth-child(2) {
+    position: sticky;
+    left: 0;
+    z-index: 3;
+}
+thead th:nth-child(2) { left: 60px; }
+
+/* Celdas */
+tbody td {
+    vertical-align: top;
+    padding: 8px 10px;
+    border: 1px solid #d0d8e4;
+    line-height: 1.55;
+    min-width: 280px;
+    max-width: 420px;
+    word-break: break-word;
+}
+
+/* Columnas fijas izquierda */
+tbody td:nth-child(1) {
+    position: sticky;
+    left: 0;
+    min-width: 50px;
+    max-width: 60px;
+    text-align: center;
+    font-weight: 700;
+    background: inherit;
+    z-index: 1;
+}
+tbody td:nth-child(2) {
+    position: sticky;
+    left: 60px;
+    min-width: 100px;
+    max-width: 130px;
+    text-align: center;
+    font-size: 0.82rem;
+    color: #4a6080;
+    background: inherit;
+    z-index: 1;
+}
+
+/* Filas alternadas por bloque */
+tr.bloque-a { background: #eef4fb; }
+tr.bloque-b { background: #f9f9f9; }
+
+/* Fila separadora entre bloques */
+tr.sep td {
+    padding: 0;
+    height: 5px;
+    background: #c8d8ea;
+    border: none;
+}
+
+/* ── Resaltado de diferencias ─────────────────────── */
+span.diff {
+    background: #ffeb3b;          /* amarillo */
+    font-weight: 700;
+    border-radius: 3px;
+    padding: 0 1px;
+}
+
+/* Texto de párrafo ausente */
+.ausente {
+    color: #888;
+    font-style: italic;
+    font-size: 0.85rem;
+}
+
+/* ── Barra de info superior ──────────────────────── */
+.info-bar {
+    background: #fff;
+    border: 1px solid #d0d8e4;
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-bottom: 18px;
+    font-size: 0.85rem;
+    color: #333;
+    line-height: 1.8;
+}
+.info-bar strong { color: #2e5395; }
+
+/* ── Leyenda ─────────────────────────────────────── */
+.leyenda {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 14px;
+    font-size: 0.83rem;
+    color: #555;
+}
+.leyenda .muestra {
+    background: #ffeb3b;
+    font-weight: 700;
+    border-radius: 3px;
+    padding: 1px 6px;
+}
+"""
 
 
 def construir_reporte(rutas, bloques, marcas_reales_por_doc, ruta_salida):
-    out = Document()
-    style = out.styles["Normal"]
-    style.font.name = "Calibri"
-    style.font.size = Pt(10.5)
+    """
+    Genera el reporte de diferencias como página HTML.
 
-    out.add_heading("Comparación de documentos Word", level=1)
-    out.add_paragraph(
-        f"Se compararon {len(rutas)} documentos, usando "
-        f"«{Path(rutas[0]).name}» como documento base. "
-        "La tabla siguiente muestra únicamente los párrafos que difieren "
-        "entre documentos, agrupados por bloque de diferencia."
-    )
+    Estructura pivot:
+      Col 1 : Bloque
+      Col 2 : Pág.(aprox.)
+      Col 3…: Una columna por documento cargado (nombre del .docx como cabecera)
 
-    if not all(marcas_reales_por_doc):
-        nota = out.add_paragraph()
-        run = nota.add_run(
-            "Nota: uno o más documentos no conservaban marcas reales de "
-            "paginación de Word, por lo que su número de página es una "
-            "estimación y no la paginación exacta al imprimir."
+    Las palabras diferentes llevan <span class="diff"> con fondo amarillo.
+    Las palabras iguales se muestran en texto plano.
+    """
+    n_docs  = len(rutas)
+    nombres = [Path(r).name for r in rutas]
+
+    # ── Encabezados de columna ──────────────────────────────────────────
+    ths = "".join(f"<th>{html.escape(n)}</th>" for n in nombres)
+    header_row = f"<tr><th>Bloque</th><th>Pág.(aprox.)</th>{ths}</tr>"
+
+    # ── Info de documentos cargados ─────────────────────────────────────
+    info_items = []
+    for idx, ruta in enumerate(rutas):
+        rol   = "BASE" if idx == 0 else f"Doc {idx + 1}"
+        marca = "" if marcas_reales_por_doc[idx] else " <em>(paginación estimada)</em>"
+        info_items.append(
+            f"<strong>[{rol}]</strong> {html.escape(Path(ruta).name)}{marca}"
         )
-        run.italic = True
-        run.font.size = Pt(9)
+    info_html = "<br>".join(info_items)
 
+    # ── Cuerpo de la tabla ──────────────────────────────────────────────
     if not bloques:
-        out.add_paragraph("No se encontraron diferencias entre los documentos.")
-        out.save(ruta_salida)
-        return
+        body_html = (
+            f'<tr><td colspan="{2 + n_docs}" style="text-align:center;padding:20px;">'
+            "No se encontraron diferencias entre los documentos.</td></tr>"
+        )
+    else:
+        filas_html = []
+        for num_bloque, filas in enumerate(bloques, start=1):
+            clase = "bloque-a" if num_bloque % 2 == 1 else "bloque-b"
 
-    tabla = out.add_table(rows=1, cols=4)
-    tabla.style = "Light Grid Accent 1"
-    tabla.alignment = WD_TABLE_ALIGNMENT.CENTER
+            # Agrupar ítems por doc_idx → lista de ítems
+            items_por_doc: dict[int, list] = {}
+            for doc_idx, item in filas:
+                items_por_doc.setdefault(doc_idx, []).append(item)
 
-    anchos      = [Cm(2.0), Cm(3.2), Cm(2.3), Cm(9.5)]
-    encabezados = ["Bloque", "Documento", "Pág. (aprox.)", "Texto del párrafo"]
-    hdr_cells   = tabla.rows[0].cells
-    for i, texto in enumerate(encabezados):
-        hdr_cells[i].width = anchos[i]
-        run = hdr_cells[i].paragraphs[0].add_run(texto)
-        run.bold = True
-        run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-        _sombrear_celda(hdr_cells[i], "2E5395")
+            max_sub    = max((len(v) for v in items_por_doc.values()), default=1)
+            base_items = items_por_doc.get(0, [])
 
-    for num_bloque, filas in enumerate(bloques, start=1):
-        # Recolectar items indexados por doc_idx para poder comparar
-        items_por_doc = {}   # doc_idx -> item (o None)
-        for doc_idx, item in filas:
-            items_por_doc[doc_idx] = item
+            for sub in range(max_sub):
+                # Col 1: Bloque
+                bloque_cel = f'<td>{num_bloque}</td>' if sub == 0 else '<td></td>'
 
-        # Texto base (doc 0) para referencia en el diff
-        item_base = items_por_doc.get(0)
-        texto_base = item_base["texto"] if item_base else ""
+                # Col 2: Pág. del doc base en esta sub-fila
+                pag_val = ""
+                if sub < len(base_items) and base_items[sub] is not None:
+                    it = base_items[sub]
+                    pag_val = f"p.{it['pagina']} ¶{it['num']}"
+                pag_cel = f"<td>{html.escape(pag_val)}</td>"
 
-        for doc_idx, item in filas:
-            row_cells = tabla.add_row().cells
-            for i, ancho in enumerate(anchos):
-                row_cells[i].width = ancho
+                # Texto de referencia para el diff
+                texto_base_sub = ""
+                if sub < len(base_items) and base_items[sub] is not None:
+                    texto_base_sub = base_items[sub]["texto"]
 
-            row_cells[0].paragraphs[0].add_run(str(num_bloque))
-            row_cells[1].paragraphs[0].add_run(
-                f"Doc. {doc_idx + 1}: {Path(rutas[doc_idx]).name}"
+                # Celdas de documentos
+                celdas = []
+                for doc_idx in range(n_docs):
+                    doc_items = items_por_doc.get(doc_idx, [])
+
+                    if sub >= len(doc_items):
+                        celdas.append("<td></td>")
+                        continue
+
+                    item = doc_items[sub]
+
+                    if item is None:
+                        celdas.append('<td><span class="ausente">'
+                                      "(párrafo ausente)</span></td>")
+                        continue
+
+                    texto_este = item["texto"]
+
+                    if doc_idx == 0:
+                        primer_otro = next(
+                            (d for d in range(1, n_docs)
+                             if sub < len(items_por_doc.get(d, []))
+                             and items_por_doc[d][sub] is not None),
+                            None,
+                        )
+                        if primer_otro is not None:
+                            texto_ref = items_por_doc[primer_otro][sub]["texto"]
+                            tokens, _ = diff_palabras(texto_este, texto_ref)
+                        else:
+                            tokens = [(texto_este, False)]
+                    else:
+                        _, tokens = diff_palabras(texto_base_sub, texto_este)
+
+                    contenido = tokens_a_html(tokens)
+                    celdas.append(f"<td>{contenido}</td>")
+
+                celdas_html = "".join(celdas)
+                filas_html.append(
+                    f'<tr class="{clase}">{bloque_cel}{pag_cel}{celdas_html}</tr>'
+                )
+
+            # Fila separadora entre bloques
+            filas_html.append(
+                f'<tr class="sep"><td colspan="{2 + n_docs}"></td></tr>'
             )
 
-            if item is None:
-                row_cells[2].paragraphs[0].add_run("—")
-                row_cells[3].paragraphs[0].add_run(
-                    "(sin texto correspondiente / párrafo ausente)"
-                ).italic = True
-            else:
-                row_cells[2].paragraphs[0].add_run(
-                    f"{item['pagina']} (párr. {item['num']})"
-                )
-                texto_este = item["texto"]
+        body_html = "\n".join(filas_html)
 
-                if doc_idx == 0:
-                    # Fila base: resaltar palabras que difieren del primer doc que cambia
-                    primer_otro_idx = next(
-                        (d for d, it in items_por_doc.items() if d != 0 and it is not None),
-                        None,
-                    )
-                    if primer_otro_idx is not None:
-                        texto_ref = items_por_doc[primer_otro_idx]["texto"]
-                        tokens_base, _ = diff_palabras(texto_este, texto_ref)
-                    else:
-                        tokens_base = [(texto_este, False)]
-                    _escribir_celda_con_diff(
-                        row_cells[3].paragraphs[0], tokens_base
-                    )
-                else:
-                    # Fila de otro doc: comparar contra la base
-                    _, tokens_otro = diff_palabras(texto_base, texto_este)
-                    _escribir_celda_con_diff(
-                        row_cells[3].paragraphs[0], tokens_otro
-                    )
+    # ── HTML completo ───────────────────────────────────────────────────
+    pagina = f"""<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Comparación de documentos Word</title>
+  <style>
+{_CSS}
+  </style>
+</head>
+<body>
 
-    tabla.autofit = False
-    out.save(ruta_salida)
+<h1>Comparación de documentos Word</h1>
+<p class="subtitle">
+  Se compararon <strong>{n_docs}</strong> documentos usando
+  <strong>{html.escape(nombres[0])}</strong> como documento base.
+  Solo se muestran los párrafos que difieren.
+</p>
+
+<div class="info-bar">
+  {info_html}
+</div>
+
+<div class="leyenda">
+  <span>Leyenda:</span>
+  <span class="muestra">palabra</span>
+  <span>= texto que difiere entre documentos</span>
+</div>
+
+<div class="wrap">
+  <table>
+    <thead>
+      {header_row}
+    </thead>
+    <tbody>
+{body_html}
+    </tbody>
+  </table>
+</div>
+
+</body>
+</html>
+"""
+
+    Path(ruta_salida).write_text(pagina, encoding="utf-8")
 
 
 # ==========================================================================
-# TRABAJO EN SEGUNDO PLANO  (sin tocar tkinter)
+# TRABAJO EN SEGUNDO PLANO
 # ==========================================================================
 
 def _comparar_en_hilo(archivos, salida, cola):
-    """Corre en un hilo; se comunica con la UI solo a través de 'cola'."""
     try:
         listas, marcas = [], []
         for ruta in archivos:
@@ -395,11 +566,12 @@ def _comparar_en_hilo(archivos, salida, cola):
         bloques = calcular_diferencias(listas)
         cola.put((_MSG_LOG, f"  Bloques de diferencia encontrados: {len(bloques)}"))
 
-        cola.put((_MSG_LOG, "Generando reporte…"))
+        cola.put((_MSG_LOG, "Generando reporte HTML…"))
         construir_reporte(archivos, bloques, marcas, salida)
         cola.put((_MSG_OK, salida))
     except Exception as exc:
-        cola.put((_MSG_ERROR, str(exc)))
+        import traceback
+        cola.put((_MSG_ERROR, traceback.format_exc()))
 
 
 # ==========================================================================
@@ -407,7 +579,7 @@ def _comparar_en_hilo(archivos, salida, cola):
 # ==========================================================================
 
 class App:
-    POLL_MS = 100   # cada cuántos ms se revisa la cola (funciona bien en macOS)
+    POLL_MS = 100
 
     def __init__(self, root):
         self.root = root
@@ -416,14 +588,12 @@ class App:
         self.root.minsize(620, 480)
 
         self.archivos = []
-        self.ruta_salida = tk.StringVar(value=str(Path.cwd() / "comparacion.docx"))
+        self.ruta_salida = tk.StringVar(value=str(Path.cwd() / "comparacion.html"))
         self.ultima_ruta_generada = None
         self._cola = queue.Queue()
 
         self._construir_widgets()
         self._log("Listo. Agrega documentos .docx y presiona «Comparar y generar reporte».")
-
-    # ---------------------------------------------------------------- UI --
 
     def _construir_widgets(self):
         PAD = {"padx": 10, "pady": 6}
@@ -439,7 +609,6 @@ class App:
             text="El primer documento de la lista es el BASE contra el que se comparan los demás.",
         ).pack(anchor="w", padx=10)
 
-        # --- Zona drag-and-drop / lista ---
         zona = ttk.LabelFrame(self.root, text="Documentos (2 – 7)")
         zona.pack(fill="both", expand=True, **PAD)
 
@@ -479,7 +648,6 @@ class App:
         ]:
             ttk.Button(bf, text=txt, command=cmd).pack(side="left", padx=2)
 
-        # --- Salida ---
         sf = ttk.LabelFrame(self.root, text="Archivo de salida")
         sf.pack(fill="x", **PAD)
         ttk.Entry(sf, textvariable=self.ruta_salida).pack(
@@ -487,7 +655,6 @@ class App:
         ttk.Button(sf, text="Examinar…", command=self._elegir_salida).pack(
             side="left", padx=(0, 8))
 
-        # --- Botones de acción ---
         af = ttk.Frame(self.root)
         af.pack(fill="x", **PAD)
 
@@ -497,11 +664,10 @@ class App:
         self.boton_comparar.pack(side="left", padx=(0, 6))
 
         self.boton_abrir = ttk.Button(
-            af, text="📄  Abrir reporte",
+            af, text="🌐  Abrir reporte en navegador",
             command=self._abrir_reporte, state="disabled")
         self.boton_abrir.pack(side="left")
 
-        # --- Log de estado ---
         ef = ttk.LabelFrame(self.root, text="Estado")
         ef.pack(fill="both", expand=True, **PAD)
 
@@ -515,8 +681,6 @@ class App:
 
         self.barra = ttk.Progressbar(self.root, mode="indeterminate")
         self.barra.pack(fill="x", padx=10, pady=(0, 10))
-
-    # ----------------------------------------------------------- helpers --
 
     def _log(self, msg):
         self.texto_estado.config(state="normal")
@@ -590,13 +754,11 @@ class App:
     def _elegir_salida(self):
         ruta = filedialog.asksaveasfilename(
             title="Guardar reporte como",
-            defaultextension=".docx",
-            filetypes=[("Documento Word", "*.docx")],
-            initialfile="comparacion.docx")
+            defaultextension=".html",
+            filetypes=[("Página HTML", "*.html"), ("Todos los archivos", "*.*")],
+            initialfile="comparacion.html")
         if ruta:
             self.ruta_salida.set(ruta)
-
-    # ---------------------------------------------------------- acciones --
 
     def _ejecutar_comparacion(self):
         if len(self.archivos) < 2:
@@ -620,13 +782,9 @@ class App:
             args=(list(self.archivos), salida, self._cola),
             daemon=True,
         ).start()
-
-        # Empezar a drenar la cola desde el hilo principal
         self.root.after(self.POLL_MS, self._drenar_cola)
 
     def _drenar_cola(self):
-        """Llamado por el mainloop; lee todos los mensajes disponibles y
-        programa otra lectura si el hilo todavía está trabajando."""
         terminado = False
         try:
             while True:
@@ -639,12 +797,11 @@ class App:
                     self._al_terminar_ok()
                     terminado = True
                 elif tipo == _MSG_ERROR:
-                    self._log(f"❌ ERROR: {datos}")
+                    self._log(f"❌ ERROR:\n{datos}")
                     self._al_terminar_error(datos)
                     terminado = True
         except queue.Empty:
             pass
-
         if not terminado:
             self.root.after(self.POLL_MS, self._drenar_cola)
 
@@ -652,7 +809,7 @@ class App:
         self.barra.stop()
         self.boton_comparar.config(state="normal")
         self.boton_abrir.config(state="normal")
-        messagebox.showinfo("Listo", "El reporte se generó correctamente.")
+        messagebox.showinfo("Listo", "El reporte HTML se generó correctamente.")
 
     def _al_terminar_error(self, msg):
         self.barra.stop()
